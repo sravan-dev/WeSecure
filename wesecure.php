@@ -1,9 +1,10 @@
 <?php
 /**
  * Plugin Name: WeSecure
- * Plugin URI: https://wesecure.dev
+ * Plugin URI: https://github.com/sravan-dev/WeSecure
+ * Update URI: https://github.com/sravan-dev/WeSecure
  * Description: Protects WordPress against XSS attacks, file injection, and malicious modification of core files like index.php.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: Sravan M
  * Author URI: https://wesecure.dev
  * License: GPL-2.0+
@@ -14,9 +15,11 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('WESECURE_VERSION', '1.0.0');
+define('WESECURE_VERSION', '1.0.1');
 define('WESECURE_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('WESECURE_PLUGIN_URL', plugin_dir_url(__FILE__));
+define('WESECURE_GITHUB_REPO', 'sravan-dev/WeSecure');
+define('WESECURE_PLUGIN_SLUG', 'wesecure/wesecure.php');
 
 class WeSecure {
 
@@ -1227,5 +1230,171 @@ class WeSecure {
     }
 }
 
+// =========================================================================
+// GITHUB AUTO-UPDATER
+// =========================================================================
+
+class WeSecure_Updater {
+
+    private $slug;
+    private $plugin_file;
+    private $github_repo;
+    private $github_response;
+
+    public function __construct() {
+        $this->slug = 'wesecure';
+        $this->plugin_file = WESECURE_PLUGIN_SLUG;
+        $this->github_repo = WESECURE_GITHUB_REPO;
+
+        add_filter('pre_set_site_transient_update_plugins', array($this, 'check_update'));
+        add_filter('plugins_api', array($this, 'plugin_info'), 20, 3);
+        add_filter('upgrader_post_install', array($this, 'after_install'), 10, 3);
+    }
+
+    /**
+     * Fetch latest release info from GitHub.
+     */
+    private function get_github_release() {
+        if (!empty($this->github_response)) {
+            return $this->github_response;
+        }
+
+        $url = sprintf('https://api.github.com/repos/%s/releases/latest', $this->github_repo);
+
+        $response = wp_remote_get($url, array(
+            'headers' => array(
+                'Accept' => 'application/vnd.github.v3+json',
+            ),
+            'timeout' => 10,
+        ));
+
+        if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+            return false;
+        }
+
+        $this->github_response = json_decode(wp_remote_retrieve_body($response));
+        return $this->github_response;
+    }
+
+    /**
+     * Check if an update is available.
+     */
+    public function check_update($transient) {
+        if (empty($transient->checked)) {
+            return $transient;
+        }
+
+        $release = $this->get_github_release();
+        if (!$release) {
+            return $transient;
+        }
+
+        // Get version from tag (strip 'v' prefix)
+        $latest_version = ltrim($release->tag_name, 'v');
+        $current_version = WESECURE_VERSION;
+
+        if (version_compare($latest_version, $current_version, '>')) {
+            $download_url = $this->get_download_url($release);
+
+            $transient->response[$this->plugin_file] = (object) array(
+                'slug'        => $this->slug,
+                'plugin'      => $this->plugin_file,
+                'new_version' => $latest_version,
+                'url'         => sprintf('https://github.com/%s', $this->github_repo),
+                'package'     => $download_url,
+                'icons'       => array(
+                    'default' => 'dashicons-shield',
+                ),
+            );
+        }
+
+        return $transient;
+    }
+
+    /**
+     * Get download URL from release assets or zipball.
+     */
+    private function get_download_url($release) {
+        // Check for uploaded zip asset first
+        if (!empty($release->assets)) {
+            foreach ($release->assets as $asset) {
+                if (strpos($asset->name, '.zip') !== false) {
+                    return $asset->browser_download_url;
+                }
+            }
+        }
+
+        // Fallback to zipball
+        return $release->zipball_url;
+    }
+
+    /**
+     * Provide plugin information for the update details popup.
+     */
+    public function plugin_info($result, $action, $args) {
+        if ($action !== 'plugin_information') {
+            return $result;
+        }
+
+        if (!isset($args->slug) || $args->slug !== $this->slug) {
+            return $result;
+        }
+
+        $release = $this->get_github_release();
+        if (!$release) {
+            return $result;
+        }
+
+        $latest_version = ltrim($release->tag_name, 'v');
+
+        $plugin_info = new \stdClass();
+        $plugin_info->name = 'WeSecure';
+        $plugin_info->slug = $this->slug;
+        $plugin_info->version = $latest_version;
+        $plugin_info->author = '<a href="https://github.com/sravan-dev">Sravan M</a>';
+        $plugin_info->homepage = sprintf('https://github.com/%s', $this->github_repo);
+        $plugin_info->requires = '5.0';
+        $plugin_info->tested = '6.7';
+        $plugin_info->requires_php = '7.4';
+        $plugin_info->downloaded = 0;
+        $plugin_info->last_updated = $release->published_at;
+        $plugin_info->download_link = $this->get_download_url($release);
+
+        // Convert markdown release notes to HTML
+        $plugin_info->sections = array(
+            'description' => 'WordPress Security Plugin - Protects against XSS, file injection, brute force, XML-RPC attacks, .htaccess tampering, and more.',
+            'changelog'   => nl2br(esc_html($release->body)),
+        );
+
+        $plugin_info->banners = array();
+
+        return $plugin_info;
+    }
+
+    /**
+     * Rename folder after install (GitHub zips have weird folder names).
+     */
+    public function after_install($response, $hook_extra, $result) {
+        if (!isset($hook_extra['plugin']) || $hook_extra['plugin'] !== $this->plugin_file) {
+            return $result;
+        }
+
+        global $wp_filesystem;
+
+        $install_dir = plugin_dir_path(dirname(__FILE__));
+        $proper_dir = $install_dir . $this->slug;
+
+        // Move to proper directory name
+        $wp_filesystem->move($result['destination'], $proper_dir);
+        $result['destination'] = $proper_dir;
+
+        // Reactivate plugin
+        activate_plugin($this->plugin_file);
+
+        return $result;
+    }
+}
+
 // Initialize plugin
 new WeSecure();
+new WeSecure_Updater();
