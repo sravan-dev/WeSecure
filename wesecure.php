@@ -123,6 +123,9 @@ class WeSecure {
         add_action('admin_menu', array($this, 'add_admin_menu'));
         add_action('admin_notices', array($this, 'display_admin_notices'));
 
+        // Site backup download handler
+        add_action('admin_post_wesecure_download_backup', array($this, 'handle_backup_download'));
+
         // Activation/Deactivation
         register_activation_hook(__FILE__, array($this, 'activate'));
         register_deactivation_hook(__FILE__, array($this, 'deactivate'));
@@ -660,6 +663,215 @@ class WeSecure {
 
         $dest = $quarantine_dir . '/' . time() . '_' . $filename;
         return rename($filepath, $dest);
+    }
+
+    // =========================================================================
+    // FULL SITE BACKUP (Database + Files)
+    // =========================================================================
+
+    /**
+     * Handle backup download request from admin panel.
+     */
+    public function handle_backup_download() {
+        if (!current_user_can('manage_options')) {
+            wp_die('Unauthorized access.');
+        }
+
+        if (!wp_verify_nonce($_GET['_wpnonce'], 'wesecure_backup')) {
+            wp_die('Security check failed.');
+        }
+
+        $zip_path = $this->create_full_backup();
+
+        if (!$zip_path || !file_exists($zip_path)) {
+            wp_redirect(admin_url('admin.php?page=wesecure&backup_error=1'));
+            exit;
+        }
+
+        // Stream the zip file to browser
+        header('Content-Type: application/zip');
+        header('Content-Disposition: attachment; filename="' . basename($zip_path) . '"');
+        header('Content-Length: ' . filesize($zip_path));
+        header('Pragma: no-cache');
+        header('Expires: 0');
+
+        readfile($zip_path);
+
+        // Clean up temp file
+        @unlink($zip_path);
+        exit;
+    }
+
+    /**
+     * Create a full site backup (database + files) as a zip.
+     *
+     * @return string|false Path to the zip file, or false on failure.
+     */
+    private function create_full_backup() {
+        if (!class_exists('ZipArchive')) {
+            return false;
+        }
+
+        $backup_dir = WP_CONTENT_DIR . '/wesecure-backups';
+        if (!is_dir($backup_dir)) {
+            wp_mkdir_p($backup_dir);
+            file_put_contents($backup_dir . '/.htaccess', "Order Deny,Allow\nDeny from all\n");
+            file_put_contents($backup_dir . '/index.php', '<?php // Silence is golden.');
+        }
+
+        $timestamp = date('Y-m-d_H-i-s');
+        $site_name = sanitize_file_name(get_bloginfo('name'));
+        $zip_filename = sprintf('wesecure-backup_%s_%s.zip', $site_name, $timestamp);
+        $zip_path = $backup_dir . '/' . $zip_filename;
+
+        $zip = new ZipArchive();
+        if ($zip->open($zip_path, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+            return false;
+        }
+
+        // 1. Export database
+        $db_dump = $this->export_database();
+        if ($db_dump) {
+            $zip->addFromString('database/database_' . $timestamp . '.sql', $db_dump);
+        }
+
+        // 2. Add WordPress files
+        $this->add_directory_to_zip($zip, ABSPATH, 'files');
+
+        $zip->close();
+
+        $this->log_threat('BACKUP', sprintf('Full site backup created: %s (%.2f MB)', $zip_filename, filesize($zip_path) / 1048576));
+
+        return $zip_path;
+    }
+
+    /**
+     * Export WordPress database to SQL string.
+     *
+     * @return string|false SQL dump string, or false on failure.
+     */
+    private function export_database() {
+        global $wpdb;
+
+        $output = "-- WeSecure Database Backup\n";
+        $output .= "-- Generated: " . date('Y-m-d H:i:s') . "\n";
+        $output .= "-- Database: " . DB_NAME . "\n";
+        $output .= "-- --------------------------------------------------------\n\n";
+        $output .= "SET SQL_MODE = \"NO_AUTO_VALUE_ON_ZERO\";\n";
+        $output .= "SET time_zone = \"+00:00\";\n";
+        $output .= "SET NAMES utf8mb4;\n\n";
+
+        $tables = $wpdb->get_col("SHOW TABLES LIKE '{$wpdb->prefix}%'");
+
+        if (empty($tables)) {
+            return false;
+        }
+
+        foreach ($tables as $table) {
+            // Table structure
+            $create = $wpdb->get_row("SHOW CREATE TABLE `{$table}`", ARRAY_N);
+            if ($create) {
+                $output .= "-- Table: {$table}\n";
+                $output .= "DROP TABLE IF EXISTS `{$table}`;\n";
+                $output .= $create[1] . ";\n\n";
+            }
+
+            // Table data in batches
+            $offset = 0;
+            $batch_size = 500;
+
+            while (true) {
+                $rows = $wpdb->get_results("SELECT * FROM `{$table}` LIMIT {$batch_size} OFFSET {$offset}", ARRAY_A);
+
+                if (empty($rows)) {
+                    break;
+                }
+
+                foreach ($rows as $row) {
+                    $values = array_map(function ($val) use ($wpdb) {
+                        if ($val === null) {
+                            return 'NULL';
+                        }
+                        return "'" . esc_sql($val) . "'";
+                    }, array_values($row));
+
+                    $columns = array_map(function ($col) {
+                        return "`{$col}`";
+                    }, array_keys($row));
+
+                    $output .= sprintf(
+                        "INSERT INTO `%s` (%s) VALUES (%s);\n",
+                        $table,
+                        implode(', ', $columns),
+                        implode(', ', $values)
+                    );
+                }
+
+                $offset += $batch_size;
+            }
+
+            $output .= "\n";
+        }
+
+        return $output;
+    }
+
+    /**
+     * Recursively add a directory to a ZipArchive.
+     *
+     * @param ZipArchive $zip      The zip archive object.
+     * @param string     $dir      Directory to add.
+     * @param string     $zip_prefix Prefix path inside zip.
+     */
+    private function add_directory_to_zip($zip, $dir, $zip_prefix) {
+        // Skip these directories/patterns
+        $skip_dirs = array(
+            'wesecure-backups',
+            'wesecure-quarantine',
+            'cache',
+            'upgrade',
+        );
+
+        $skip_extensions = array('zip', 'gz', 'tar', 'log');
+        $max_file_size = 50 * 1048576; // 50MB per file limit
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+
+        foreach ($iterator as $item) {
+            $path = $item->getPathname();
+            // Normalize path separators
+            $relative = str_replace('\\', '/', substr($path, strlen($dir)));
+
+            // Skip excluded directories
+            $skip = false;
+            foreach ($skip_dirs as $skip_dir) {
+                if (strpos($relative, $skip_dir) !== false) {
+                    $skip = true;
+                    break;
+                }
+            }
+            if ($skip) {
+                continue;
+            }
+
+            if ($item->isDir()) {
+                $zip->addEmptyDir($zip_prefix . '/' . $relative);
+            } else {
+                // Skip large files and excluded extensions
+                $ext = strtolower(pathinfo($relative, PATHINFO_EXTENSION));
+                if (in_array($ext, $skip_extensions, true)) {
+                    continue;
+                }
+                if ($item->getSize() > $max_file_size) {
+                    continue;
+                }
+
+                $zip->addFile($path, $zip_prefix . '/' . $relative);
+            }
+        }
     }
 
     /**
@@ -1281,6 +1493,30 @@ class WeSecure {
                         <p class="description">Updates stored checksums to current file state (use after legitimate updates).</p>
                     </form>
                 </div>
+            </div>
+
+            <!-- Full Site Backup -->
+            <div class="card" style="padding: 20px; margin-top: 20px; border-left: 4px solid #0073aa;">
+                <h2>&#128230; Full Site Backup</h2>
+                <p>Download a complete backup of your WordPress site including all files and database.</p>
+                <?php if (class_exists('ZipArchive')): ?>
+                    <a href="<?php echo wp_nonce_url(admin_url('admin-post.php?action=wesecure_download_backup'), 'wesecure_backup'); ?>"
+                       class="button button-primary"
+                       onclick="this.innerHTML='&#9203; Creating backup... please wait';this.style.pointerEvents='none';">
+                        Download Full Backup
+                    </a>
+                    <p class="description" style="margin-top:8px;">
+                        Includes: All WordPress files + full database export (SQL).<br>
+                        Skips: backup archives, quarantine folder, cache, log files, and files over 50 MB.
+                    </p>
+                <?php else: ?>
+                    <p style="color: #d63638;"><strong>ZipArchive PHP extension is not available.</strong> Please ask your host to enable it.</p>
+                <?php endif; ?>
+                <?php if (isset($_GET['backup_error'])): ?>
+                    <div class="notice notice-error inline" style="margin-top:10px;">
+                        <p>Backup creation failed. Check server permissions and disk space.</p>
+                    </div>
+                <?php endif; ?>
             </div>
 
             <!-- .htaccess Info -->
