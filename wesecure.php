@@ -65,9 +65,10 @@ class WeSecure {
             add_action('init', array($this, 'block_file_injection'), 1);
         }
 
-        // Core File Integrity Monitor
+        // Core File Integrity Monitor + Foreign File Detection
         if ($this->is_enabled('enable_file_integrity')) {
             add_action('admin_init', array($this, 'check_core_file_integrity'));
+            add_action('admin_init', array($this, 'detect_foreign_files'));
             add_action('wesecure_integrity_check', array($this, 'scheduled_integrity_check'));
         }
 
@@ -145,6 +146,7 @@ class WeSecure {
 
         $this->store_file_checksums();
         $this->backup_protected_files();
+        $this->snapshot_root_files();
         $this->backup_htaccess();
 
         if (!wp_next_scheduled('wesecure_integrity_check')) {
@@ -495,6 +497,169 @@ class WeSecure {
      */
     public function scheduled_integrity_check() {
         $this->check_core_file_integrity();
+        $this->detect_foreign_files();
+    }
+
+    /**
+     * Snapshot legitimate files in WordPress root on activation.
+     */
+    private function snapshot_root_files() {
+        $files = $this->list_root_files();
+        update_option('wesecure_root_snapshot', $files);
+    }
+
+    /**
+     * List all files in WordPress root directory (non-recursive).
+     *
+     * @return array Filenames in ABSPATH root.
+     */
+    private function list_root_files() {
+        $files = array();
+        $handle = opendir(ABSPATH);
+        if ($handle) {
+            while (($entry = readdir($handle)) !== false) {
+                if ($entry === '.' || $entry === '..') {
+                    continue;
+                }
+                $path = ABSPATH . $entry;
+                if (is_file($path)) {
+                    $files[] = $entry;
+                }
+            }
+            closedir($handle);
+        }
+        return $files;
+    }
+
+    /**
+     * Detect foreign (injected) files in WordPress root.
+     * Quarantines files with suspicious extensions or names not in the original snapshot.
+     */
+    public function detect_foreign_files() {
+        $snapshot = get_option('wesecure_root_snapshot', array());
+        if (empty($snapshot)) {
+            $this->snapshot_root_files();
+            return;
+        }
+
+        // Suspicious extensions that should never appear in WP root
+        $dangerous_extensions = array(
+            'gz', 'tar', 'zip', 'sh', 'py', 'pl', 'cgi', 'exe', 'bat',
+            'com', 'cmd', 'msi', 'scr', 'pif', 'hta', 'wsf', 'jsp',
+            'asp', 'aspx', 'rb', 'bin', 'dat', 'bak',
+        );
+
+        $current_files = $this->list_root_files();
+        $new_files = array_diff($current_files, $snapshot);
+
+        if (empty($new_files)) {
+            return;
+        }
+
+        $quarantine_dir = WP_CONTENT_DIR . '/wesecure-quarantine';
+        $alerts = array();
+
+        foreach ($new_files as $file) {
+            $filepath = ABSPATH . $file;
+            $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+            $is_dangerous = in_array($ext, $dangerous_extensions, true);
+
+            // Also flag PHP files with names similar to core files (typosquatting)
+            $is_typosquat = false;
+            if ($ext === 'php') {
+                $is_typosquat = $this->is_typosquat($file);
+            }
+
+            if ($is_dangerous || $is_typosquat) {
+                $this->log_threat('FOREIGN_FILE', sprintf(
+                    'Suspicious file detected and quarantined: %s (%s)',
+                    $file,
+                    $is_typosquat ? 'possible typosquat' : 'dangerous extension'
+                ));
+
+                // Quarantine the file
+                if ($this->quarantine_file($filepath, $file, $quarantine_dir)) {
+                    $alerts[] = sprintf('CRITICAL: Foreign file quarantined: %s', $file);
+                } else {
+                    $alerts[] = sprintf('WARNING: Suspicious foreign file detected but quarantine failed: %s', $file);
+                }
+            } else {
+                // Non-dangerous new file — log for awareness
+                $this->log_threat('FOREIGN_FILE', sprintf(
+                    'New file detected in WordPress root: %s',
+                    $file
+                ));
+            }
+        }
+
+        if (!empty($alerts)) {
+            $existing_alerts = get_option('wesecure_alerts', array());
+            $all_alerts = array_merge($existing_alerts, $alerts);
+            update_option('wesecure_alerts', $all_alerts);
+            $this->notify_admin($alerts);
+        }
+    }
+
+    /**
+     * Check if a filename is a typosquat of a known WordPress core file.
+     *
+     * @param string $filename The filename to check.
+     * @return bool True if likely typosquat.
+     */
+    private function is_typosquat($filename) {
+        $core_files = array(
+            'wp-login.php', 'wp-signup.php', 'wp-settings.php',
+            'wp-config.php', 'wp-load.php', 'wp-blog-header.php',
+            'wp-cron.php', 'wp-mail.php', 'wp-links-opml.php',
+            'wp-activate.php', 'wp-comments-post.php', 'wp-trackback.php',
+            'xmlrpc.php', 'index.php',
+        );
+
+        $name_no_ext = pathinfo($filename, PATHINFO_FILENAME);
+
+        foreach ($core_files as $core) {
+            $core_no_ext = pathinfo($core, PATHINFO_FILENAME);
+
+            // Skip exact matches — those are legitimate
+            if ($filename === $core) {
+                return false;
+            }
+
+            // Levenshtein distance of 1-2 = likely typosquat
+            $distance = levenshtein($name_no_ext, $core_no_ext);
+            if ($distance > 0 && $distance <= 2) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Move a suspicious file to quarantine directory.
+     *
+     * @param string $filepath Full path to the file.
+     * @param string $filename Original filename.
+     * @param string $quarantine_dir Quarantine directory path.
+     * @return bool True if quarantined successfully.
+     */
+    private function quarantine_file($filepath, $filename, $quarantine_dir) {
+        if (!file_exists($filepath)) {
+            return false;
+        }
+
+        if (!is_dir($quarantine_dir)) {
+            wp_mkdir_p($quarantine_dir);
+            // Block web access to quarantine folder
+            file_put_contents(
+                $quarantine_dir . '/.htaccess',
+                "Order Deny,Allow\nDeny from all\n"
+            );
+            file_put_contents($quarantine_dir . '/index.php', '<?php // Silence is golden.');
+        }
+
+        $dest = $quarantine_dir . '/' . time() . '_' . $filename;
+        return rename($filepath, $dest);
     }
 
     /**
