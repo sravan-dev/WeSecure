@@ -123,7 +123,9 @@ class WeSecure {
         add_action('admin_menu', array($this, 'add_admin_menu'));
         add_action('admin_notices', array($this, 'display_admin_notices'));
 
-        // Site backup download handler
+        // Site backup AJAX handlers
+        add_action('wp_ajax_wesecure_start_backup', array($this, 'ajax_start_backup'));
+        add_action('wp_ajax_wesecure_backup_progress', array($this, 'ajax_backup_progress'));
         add_action('admin_post_wesecure_download_backup', array($this, 'handle_backup_download'));
 
         // Activation/Deactivation
@@ -666,11 +668,81 @@ class WeSecure {
     }
 
     // =========================================================================
-    // FULL SITE BACKUP (Database + Files)
+    // FULL SITE BACKUP (Database + Files) with AJAX Progress
     // =========================================================================
 
     /**
-     * Handle backup download request from admin panel.
+     * AJAX: Start backup process.
+     */
+    public function ajax_start_backup() {
+        check_ajax_referer('wesecure_backup', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized.');
+        }
+
+        // Reset progress
+        update_option('wesecure_backup_progress', array(
+            'status'  => 'starting',
+            'step'    => 'Initializing backup...',
+            'percent' => 0,
+            'file'    => '',
+        ));
+
+        // Increase limits for large sites
+        @set_time_limit(600);
+        @ini_set('memory_limit', '512M');
+
+        $zip_path = $this->create_full_backup();
+
+        if (!$zip_path || !file_exists($zip_path)) {
+            update_option('wesecure_backup_progress', array(
+                'status'  => 'error',
+                'step'    => 'Backup failed. Check permissions and disk space.',
+                'percent' => 0,
+                'file'    => '',
+            ));
+            wp_send_json_error('Backup creation failed.');
+        }
+
+        $size_mb = round(filesize($zip_path) / 1048576, 2);
+
+        update_option('wesecure_backup_progress', array(
+            'status'  => 'done',
+            'step'    => sprintf('Backup complete! (%s MB)', $size_mb),
+            'percent' => 100,
+            'file'    => basename($zip_path),
+        ));
+
+        wp_send_json_success(array(
+            'file'     => basename($zip_path),
+            'size'     => $size_mb . ' MB',
+            'download' => wp_nonce_url(admin_url('admin-post.php?action=wesecure_download_backup&file=' . urlencode(basename($zip_path))), 'wesecure_backup'),
+        ));
+    }
+
+    /**
+     * AJAX: Return current backup progress.
+     */
+    public function ajax_backup_progress() {
+        check_ajax_referer('wesecure_backup', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized.');
+        }
+
+        $progress = get_option('wesecure_backup_progress', array(
+            'status'  => 'idle',
+            'step'    => '',
+            'percent' => 0,
+            'file'    => '',
+        ));
+
+        wp_send_json_success($progress);
+    }
+
+    /**
+     * Handle backup file download.
      */
     public function handle_backup_download() {
         if (!current_user_can('manage_options')) {
@@ -681,29 +753,44 @@ class WeSecure {
             wp_die('Security check failed.');
         }
 
-        $zip_path = $this->create_full_backup();
+        $filename = isset($_GET['file']) ? sanitize_file_name($_GET['file']) : '';
+        $backup_dir = WP_CONTENT_DIR . '/wesecure-backups';
+        $zip_path = $backup_dir . '/' . $filename;
 
-        if (!$zip_path || !file_exists($zip_path)) {
-            wp_redirect(admin_url('admin.php?page=wesecure&backup_error=1'));
-            exit;
+        if (empty($filename) || !file_exists($zip_path) || pathinfo($filename, PATHINFO_EXTENSION) !== 'zip') {
+            wp_die('Backup file not found.');
         }
 
-        // Stream the zip file to browser
         header('Content-Type: application/zip');
-        header('Content-Disposition: attachment; filename="' . basename($zip_path) . '"');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
         header('Content-Length: ' . filesize($zip_path));
         header('Pragma: no-cache');
         header('Expires: 0');
 
         readfile($zip_path);
 
-        // Clean up temp file
+        // Clean up after download
         @unlink($zip_path);
         exit;
     }
 
     /**
-     * Create a full site backup (database + files) as a zip.
+     * Update backup progress in the database.
+     *
+     * @param string $step    Current step description.
+     * @param int    $percent Progress percentage (0-100).
+     */
+    private function update_backup_progress($step, $percent) {
+        update_option('wesecure_backup_progress', array(
+            'status'  => 'running',
+            'step'    => $step,
+            'percent' => min(99, max(0, $percent)),
+            'file'    => '',
+        ));
+    }
+
+    /**
+     * Create a full site backup with progress tracking.
      *
      * @return string|false Path to the zip file, or false on failure.
      */
@@ -729,15 +816,20 @@ class WeSecure {
             return false;
         }
 
-        // 1. Export database
+        // Phase 1: Database (0-30%)
+        $this->update_backup_progress('Exporting database...', 5);
         $db_dump = $this->export_database();
         if ($db_dump) {
             $zip->addFromString('database/database_' . $timestamp . '.sql', $db_dump);
         }
+        $this->update_backup_progress('Database export complete.', 30);
 
-        // 2. Add WordPress files
+        // Phase 2: Files (30-95%)
+        $this->update_backup_progress('Scanning files...', 32);
         $this->add_directory_to_zip($zip, ABSPATH, 'files');
 
+        // Phase 3: Finalize (95-100%)
+        $this->update_backup_progress('Compressing archive...', 95);
         $zip->close();
 
         $this->log_threat('BACKUP', sprintf('Full site backup created: %s (%.2f MB)', $zip_filename, filesize($zip_path) / 1048576));
@@ -746,7 +838,7 @@ class WeSecure {
     }
 
     /**
-     * Export WordPress database to SQL string.
+     * Export WordPress database to SQL string with progress updates.
      *
      * @return string|false SQL dump string, or false on failure.
      */
@@ -767,8 +859,12 @@ class WeSecure {
             return false;
         }
 
-        foreach ($tables as $table) {
-            // Table structure
+        $total_tables = count($tables);
+
+        foreach ($tables as $i => $table) {
+            $pct = 5 + intval(($i / $total_tables) * 25);
+            $this->update_backup_progress(sprintf('Exporting table: %s (%d/%d)', $table, $i + 1, $total_tables), $pct);
+
             $create = $wpdb->get_row("SHOW CREATE TABLE `{$table}`", ARRAY_N);
             if ($create) {
                 $output .= "-- Table: {$table}\n";
@@ -776,7 +872,6 @@ class WeSecure {
                 $output .= $create[1] . ";\n\n";
             }
 
-            // Table data in batches
             $offset = 0;
             $batch_size = 500;
 
@@ -788,7 +883,7 @@ class WeSecure {
                 }
 
                 foreach ($rows as $row) {
-                    $values = array_map(function ($val) use ($wpdb) {
+                    $values = array_map(function ($val) {
                         if ($val === null) {
                             return 'NULL';
                         }
@@ -817,14 +912,13 @@ class WeSecure {
     }
 
     /**
-     * Recursively add a directory to a ZipArchive.
+     * Recursively add a directory to a ZipArchive with progress tracking.
      *
-     * @param ZipArchive $zip      The zip archive object.
-     * @param string     $dir      Directory to add.
+     * @param ZipArchive $zip        The zip archive object.
+     * @param string     $dir        Directory to add.
      * @param string     $zip_prefix Prefix path inside zip.
      */
     private function add_directory_to_zip($zip, $dir, $zip_prefix) {
-        // Skip these directories/patterns
         $skip_dirs = array(
             'wesecure-backups',
             'wesecure-quarantine',
@@ -833,8 +927,10 @@ class WeSecure {
         );
 
         $skip_extensions = array('zip', 'gz', 'tar', 'log');
-        $max_file_size = 50 * 1048576; // 50MB per file limit
+        $max_file_size = 50 * 1048576;
 
+        // First pass: count total files for progress
+        $all_files = array();
         $iterator = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
             RecursiveIteratorIterator::SELF_FIRST
@@ -842,10 +938,8 @@ class WeSecure {
 
         foreach ($iterator as $item) {
             $path = $item->getPathname();
-            // Normalize path separators
             $relative = str_replace('\\', '/', substr($path, strlen($dir)));
 
-            // Skip excluded directories
             $skip = false;
             foreach ($skip_dirs as $skip_dir) {
                 if (strpos($relative, $skip_dir) !== false) {
@@ -857,10 +951,7 @@ class WeSecure {
                 continue;
             }
 
-            if ($item->isDir()) {
-                $zip->addEmptyDir($zip_prefix . '/' . $relative);
-            } else {
-                // Skip large files and excluded extensions
+            if (!$item->isDir()) {
                 $ext = strtolower(pathinfo($relative, PATHINFO_EXTENSION));
                 if (in_array($ext, $skip_extensions, true)) {
                     continue;
@@ -868,8 +959,32 @@ class WeSecure {
                 if ($item->getSize() > $max_file_size) {
                     continue;
                 }
+            }
 
-                $zip->addFile($path, $zip_prefix . '/' . $relative);
+            $all_files[] = array(
+                'path'     => $path,
+                'relative' => $relative,
+                'is_dir'   => $item->isDir(),
+            );
+        }
+
+        $total = count($all_files);
+        $progress_interval = max(1, intval($total / 50)); // Update every ~2%
+
+        // Second pass: add to zip with progress
+        foreach ($all_files as $i => $file) {
+            if ($file['is_dir']) {
+                $zip->addEmptyDir($zip_prefix . '/' . $file['relative']);
+            } else {
+                $zip->addFile($file['path'], $zip_prefix . '/' . $file['relative']);
+            }
+
+            if ($i % $progress_interval === 0) {
+                $pct = 32 + intval(($i / $total) * 63);
+                $this->update_backup_progress(
+                    sprintf('Adding files... (%d/%d) %s', $i + 1, $total, basename($file['relative'])),
+                    $pct
+                );
             }
         }
     }
@@ -1500,24 +1615,128 @@ class WeSecure {
                 <h2>&#128230; Full Site Backup</h2>
                 <p>Download a complete backup of your WordPress site including all files and database.</p>
                 <?php if (class_exists('ZipArchive')): ?>
-                    <a href="<?php echo wp_nonce_url(admin_url('admin-post.php?action=wesecure_download_backup'), 'wesecure_backup'); ?>"
-                       class="button button-primary"
-                       onclick="this.innerHTML='&#9203; Creating backup... please wait';this.style.pointerEvents='none';">
-                        Download Full Backup
-                    </a>
-                    <p class="description" style="margin-top:8px;">
-                        Includes: All WordPress files + full database export (SQL).<br>
-                        Skips: backup archives, quarantine folder, cache, log files, and files over 50 MB.
-                    </p>
+                    <div id="wesecure-backup-controls">
+                        <button type="button" id="wesecure-start-backup" class="button button-primary">
+                            Create &amp; Download Backup
+                        </button>
+                        <p class="description" style="margin-top:8px;">
+                            Includes: All WordPress files + full database export (SQL).<br>
+                            Skips: backup archives, quarantine folder, cache, log files, and files over 50 MB.
+                        </p>
+                    </div>
+
+                    <!-- Progress Bar -->
+                    <div id="wesecure-backup-progress" style="display:none; margin-top:15px;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                            <span id="wesecure-backup-step" style="font-weight:500;">Starting...</span>
+                            <span id="wesecure-backup-pct" style="font-weight:600;">0%</span>
+                        </div>
+                        <div style="background:#e0e0e0; border-radius:4px; height:24px; overflow:hidden; position:relative;">
+                            <div id="wesecure-backup-bar" style="
+                                background: linear-gradient(90deg, #0073aa, #00a0d2);
+                                height:100%;
+                                width:0%;
+                                border-radius:4px;
+                                transition: width 0.4s ease;
+                            "></div>
+                        </div>
+                        <div id="wesecure-backup-result" style="margin-top:12px; display:none;"></div>
+                    </div>
                 <?php else: ?>
                     <p style="color: #d63638;"><strong>ZipArchive PHP extension is not available.</strong> Please ask your host to enable it.</p>
                 <?php endif; ?>
-                <?php if (isset($_GET['backup_error'])): ?>
-                    <div class="notice notice-error inline" style="margin-top:10px;">
-                        <p>Backup creation failed. Check server permissions and disk space.</p>
-                    </div>
-                <?php endif; ?>
             </div>
+
+            <script>
+            (function() {
+                var btn = document.getElementById('wesecure-start-backup');
+                var progressWrap = document.getElementById('wesecure-backup-progress');
+                var bar = document.getElementById('wesecure-backup-bar');
+                var stepEl = document.getElementById('wesecure-backup-step');
+                var pctEl = document.getElementById('wesecure-backup-pct');
+                var resultEl = document.getElementById('wesecure-backup-result');
+                var pollTimer = null;
+                var ajaxUrl = '<?php echo admin_url("admin-ajax.php"); ?>';
+                var nonce = '<?php echo wp_create_nonce("wesecure_backup"); ?>';
+
+                function updateBar(percent, step) {
+                    bar.style.width = percent + '%';
+                    pctEl.textContent = percent + '%';
+                    if (step) stepEl.textContent = step;
+                }
+
+                function pollProgress() {
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', ajaxUrl, true);
+                    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+                    xhr.onload = function() {
+                        if (xhr.status === 200) {
+                            try {
+                                var resp = JSON.parse(xhr.responseText);
+                                if (resp.success && resp.data) {
+                                    updateBar(resp.data.percent, resp.data.step);
+                                    if (resp.data.status === 'done' || resp.data.status === 'error') {
+                                        clearInterval(pollTimer);
+                                    }
+                                }
+                            } catch(e) {}
+                        }
+                    };
+                    xhr.send('action=wesecure_backup_progress&nonce=' + nonce);
+                }
+
+                btn.addEventListener('click', function() {
+                    btn.disabled = true;
+                    btn.textContent = 'Backup in progress...';
+                    progressWrap.style.display = 'block';
+                    resultEl.style.display = 'none';
+                    updateBar(0, 'Initializing backup...');
+
+                    // Start polling progress
+                    pollTimer = setInterval(pollProgress, 1500);
+
+                    // Fire the backup request
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', ajaxUrl, true);
+                    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+                    xhr.onload = function() {
+                        clearInterval(pollTimer);
+                        try {
+                            var resp = JSON.parse(xhr.responseText);
+                            if (resp.success && resp.data) {
+                                updateBar(100, 'Backup complete! (' + resp.data.size + ')');
+                                bar.style.background = 'linear-gradient(90deg, #00a32a, #00ba37)';
+                                resultEl.innerHTML =
+                                    '<a href="' + resp.data.download + '" class="button button-primary" style="margin-right:10px;">' +
+                                    '&#11015; Download Backup (' + resp.data.size + ')</a>' +
+                                    '<span style="color:#00a32a; font-weight:600;">&#10003; Ready for download</span>';
+                                resultEl.style.display = 'block';
+                            } else {
+                                updateBar(0, 'Backup failed!');
+                                bar.style.background = '#d63638';
+                                resultEl.innerHTML = '<span style="color:#d63638; font-weight:600;">Backup failed. Check server permissions and disk space.</span>';
+                                resultEl.style.display = 'block';
+                            }
+                        } catch(e) {
+                            updateBar(0, 'Backup failed!');
+                            bar.style.background = '#d63638';
+                            resultEl.innerHTML = '<span style="color:#d63638;">Unexpected error. Check server logs.</span>';
+                            resultEl.style.display = 'block';
+                        }
+                        btn.disabled = false;
+                        btn.textContent = 'Create & Download Backup';
+                    };
+                    xhr.onerror = function() {
+                        clearInterval(pollTimer);
+                        updateBar(0, 'Connection error.');
+                        bar.style.background = '#d63638';
+                        btn.disabled = false;
+                        btn.textContent = 'Create & Download Backup';
+                    };
+                    xhr.send('action=wesecure_start_backup&nonce=' + nonce);
+                });
+            })();
+            </script>
 
             <!-- .htaccess Info -->
             <?php if ($this->is_enabled('enable_htaccess_protection')): ?>
