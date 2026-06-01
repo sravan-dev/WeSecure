@@ -144,6 +144,7 @@ class WeSecure {
         }
 
         $this->store_file_checksums();
+        $this->backup_protected_files();
         $this->backup_htaccess();
 
         if (!wp_next_scheduled('wesecure_integrity_check')) {
@@ -397,6 +398,50 @@ class WeSecure {
     }
 
     /**
+     * Back up protected file contents for auto-restore on tampering.
+     */
+    private function backup_protected_files() {
+        $backups = get_option('wesecure_file_backups', array());
+
+        foreach ($this->protected_files as $file) {
+            $filepath = ABSPATH . $file;
+            if (file_exists($filepath)) {
+                $contents = file_get_contents($filepath);
+                if ($contents !== false) {
+                    $backups[$file] = base64_encode($contents);
+                }
+            }
+        }
+
+        update_option('wesecure_file_backups', $backups);
+    }
+
+    /**
+     * Restore a protected file from backup.
+     *
+     * @param string $file Filename relative to ABSPATH.
+     * @return bool True if restored successfully.
+     */
+    private function restore_protected_file($file) {
+        $backups = get_option('wesecure_file_backups', array());
+
+        if (empty($backups[$file])) {
+            return false;
+        }
+
+        $filepath = ABSPATH . $file;
+        $contents = base64_decode($backups[$file]);
+
+        if ($contents === false) {
+            return false;
+        }
+
+        $result = file_put_contents($filepath, $contents, LOCK_EX);
+
+        return $result !== false;
+    }
+
+    /**
      * Check core file integrity against stored checksums.
      */
     public function check_core_file_integrity() {
@@ -413,8 +458,16 @@ class WeSecure {
             $filepath = ABSPATH . $file;
 
             if (!file_exists($filepath)) {
-                $alerts[] = sprintf('CRITICAL: Protected file missing: %s', $file);
                 $this->log_threat('FILE_TAMPER', 'Protected file missing: ' . $file);
+
+                // Attempt auto-restore from backup
+                if ($this->restore_protected_file($file)) {
+                    $this->log_threat('FILE_RESTORE', 'Auto-restored protected file: ' . $file);
+                    $alerts[] = sprintf('CRITICAL: Protected file missing: %s (auto-restored)', $file);
+                } else {
+                    $alerts[] = sprintf('CRITICAL: Protected file missing: %s (restore failed - no backup)', $file);
+                    $this->log_threat('FILE_RESTORE_FAIL', 'Failed to restore protected file: ' . $file);
+                }
                 continue;
             }
 
